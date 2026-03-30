@@ -8,7 +8,9 @@ Modules:
 --------
 - lane_detection: Phase 1 - Detect lane boundaries (top, bottom, left, right)
 - ball_detection: Phase 2 - Track ball trajectory from foul line to pins
+- trajectory_3d: Phase 3 - Reconstruct trajectory in lane coordinates via homography
 - pin_detection: Phase 4 - Count toppled pins using frame differencing
+- spin_analysis: Phase 5 - Analyze ball spin/rotation via optical flow + Kabsch
 
 Version: 1.0.0
 Authors: Mohammad Umayr Romshoo, Mohammad Ammar Mughees
@@ -32,15 +34,27 @@ except ImportError:
     ball_detection = None
 
 try:
+    from . import trajectory_3d
+except ImportError:
+    trajectory_3d = None
+
+try:
     from . import pin_detection
 except ImportError:
     pin_detection = None
 
+try:
+    from . import spin_analysis
+except ImportError:
+    spin_analysis = None
+
 # Export public API
 __all__ = [
     'lane_detection',
-    'ball_detection', 
+    'ball_detection',
+    'trajectory_3d',
     'pin_detection',
+    'spin_analysis',
     '__version__',
 ]
 
@@ -121,7 +135,7 @@ def run_lane_detection(video_name=None):
     if video_name:
         # Process single video
         detector = LaneDetector(video_name)
-        return detector.detect_all_boundaries()
+        return detector.detect_all()
     else:
         # Process all configured videos
         from .lane_detection import config
