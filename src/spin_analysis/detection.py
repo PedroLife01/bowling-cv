@@ -277,6 +277,13 @@ def _fill_frames(video_path, csv_path):
 
     df_coords = pd.read_csv(csv_path)
 
+    # Map radius column: ball_detection outputs radius_x/radius_fitted, not 'radius'
+    if 'radius' not in df_coords.columns:
+        if 'radius_fitted' in df_coords.columns:
+            df_coords['radius'] = df_coords['radius_fitted']
+        elif 'radius_x' in df_coords.columns:
+            df_coords['radius'] = df_coords['radius_x']
+
     full_df = pd.DataFrame({
         'frame': list(range(frame_count)),
         'x': [None] * frame_count,

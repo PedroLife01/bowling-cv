@@ -108,7 +108,7 @@ def _find_output_files(video_name: str, subfolder: str, pattern: str) -> list:
 def main():
     st.set_page_config(
         page_title="Bowling CV Analysis",
-        layout="centered",
+        layout="wide",
         initial_sidebar_state="expanded",
     )
     st.title("Bowling CV Analysis Pipeline")
@@ -394,12 +394,17 @@ def _page_realtime_camera():
 def _run_realtime_feed():
     """Run the real-time camera feed with lane calibration and ball tracking."""
 
-    # Add src to path for imports
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
     from realtime import config as rt_config
     from realtime.calibrator import LaneCalibrator
     from realtime.tracker import RealtimeTracker
+    from lane_detection import config as lane_config
+
+    # Override lane config for faster real-time calibration (30 frames instead of 100)
+    REALTIME_CALIBRATION_FRAMES = 30
+    original_num = lane_config.NUM_COLLECTION_FRAMES
+    lane_config.NUM_COLLECTION_FRAMES = REALTIME_CALIBRATION_FRAMES
 
     camera_idx = st.session_state.rt_camera_idx
     cap = cv2.VideoCapture(camera_idx)
@@ -410,32 +415,42 @@ def _run_realtime_feed():
             "Try a different index or check your USB connection."
         )
         st.session_state.rt_running = False
+        lane_config.NUM_COLLECTION_FRAMES = original_num
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, rt_config.CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rt_config.CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    st.write(f"Camera opened: {w}x{h} (index {camera_idx})")
 
-    frame_placeholder = st.empty()
-    status_placeholder = st.empty()
-    metrics_placeholder = st.empty()
+    # Layout: video feed on left (large), info panel on right
+    col_feed, col_info = st.columns([3, 1])
+
+    with col_info:
+        st.markdown(f"**Camera:** {w}x{h} (idx {camera_idx})")
+        status_placeholder = st.empty()
+        progress_placeholder = st.empty()
+        metrics_placeholder = st.empty()
+        state_placeholder = st.empty()
+        throws_placeholder = st.empty()
+
+    with col_feed:
+        frame_placeholder = st.empty()
 
     calibrator = LaneCalibrator()
     tracker = None
     state = "calibrating"
     before_frame = None
     pin_settle_start = None
+    result_start = None
     frame_count = 0
 
     try:
         while st.session_state.rt_running:
             ret, frame = cap.read()
             if not ret:
-                status_placeholder.warning("Camera frame read failed. Retrying...")
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
 
             frame_count += 1
@@ -443,60 +458,77 @@ def _run_realtime_feed():
 
             # === CALIBRATING ===
             if state == "calibrating":
-                status_placeholder.info(
-                    f"Calibrating lane boundaries... "
-                    f"(frame {calibrator._frame_count if hasattr(calibrator, '_frame_count') else frame_count})"
-                )
-
                 done = calibrator.add_frame(frame)
+                progress = calibrator.progress
 
-                # Draw calibration progress
-                cv2.putText(
-                    vis_frame, "CALIBRATING - Keep camera steady",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
+                # Progress bar
+                progress_placeholder.progress(
+                    progress,
+                    text=f"Calibrating: {int(progress * 100)}% ({len(calibrator._collected_frames)}/{REALTIME_CALIBRATION_FRAMES} frames)"
                 )
+
+                # Draw progress bar on frame
+                bar_w = int(vis_frame.shape[1] * 0.6)
+                bar_h = 30
+                bar_x = (vis_frame.shape[1] - bar_w) // 2
+                bar_y = vis_frame.shape[0] - 60
+                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+                fill_w = int(bar_w * progress)
+                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 200, 255), -1)
+                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 2)
+
+                _draw_text_with_bg(vis_frame, "CALIBRATING - Keep camera steady on the lane",
+                                   (10, 40), scale=0.9, color=(0, 200, 255))
+                _draw_text_with_bg(vis_frame, f"{int(progress * 100)}%",
+                                   (bar_x + bar_w // 2 - 20, bar_y + 22), scale=0.7, color=(255, 255, 255))
 
                 if done:
                     b = calibrator.boundaries
-                    tracker = RealtimeTracker(
-                        rt_config,
-                        b["frame_width"], b["frame_height"],
-                        b["foul_line_y"],
-                        top_boundary_y=b.get("top_y"),
-                    )
-                    before_frame = frame.copy()
-                    state = "waiting"
-                    status_placeholder.success("Lane calibrated! Waiting for throw...")
+                    try:
+                        tracker = RealtimeTracker(
+                            rt_config,
+                            b["frame_width"], b["frame_height"],
+                            b["foul_line_y"],
+                            top_boundary_y=b.get("top_y"),
+                        )
+                        before_frame = frame.copy()
+                        state = "waiting"
+                        progress_placeholder.empty()
+                        status_placeholder.success("Lane calibrated!")
+                    except Exception as e:
+                        status_placeholder.error(f"Tracker init failed: {e}")
+                        state = "calibrating"
+                        calibrator = LaneCalibrator()
 
             # === WAITING ===
             elif state == "waiting":
-                masked = calibrator.apply_mask(frame)
-                result = tracker.process_frame(masked)
+                try:
+                    masked = calibrator.apply_mask(frame)
+                    result = tracker.process_frame(masked)
+                except Exception:
+                    result = {}
 
-                # Draw lane boundaries
                 _draw_boundaries(vis_frame, calibrator)
-
-                cv2.putText(
-                    vis_frame, "WAITING - Roll the ball",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-                )
+                _draw_text_with_bg(vis_frame, "READY - Roll the ball",
+                                   (10, 40), scale=0.9, color=(0, 255, 0))
+                state_placeholder.info("Waiting for throw...")
 
                 if result.get("detection") is not None:
                     state = "tracking"
-                    status_placeholder.info("Ball detected! Tracking...")
 
             # === TRACKING ===
             elif state == "tracking":
-                masked = calibrator.apply_mask(frame)
-                result = tracker.process_frame(masked)
+                try:
+                    masked = calibrator.apply_mask(frame)
+                    result = tracker.process_frame(masked)
+                except Exception:
+                    result = {}
 
                 _draw_boundaries(vis_frame, calibrator)
                 _draw_ball(vis_frame, result)
-
-                cv2.putText(
-                    vis_frame, "TRACKING",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
-                )
+                _draw_text_with_bg(vis_frame, "TRACKING",
+                                   (10, 40), scale=0.9, color=(0, 100, 255))
+                state_placeholder.warning("Tracking ball...")
 
                 if result.get("throw_complete", False):
                     pin_settle_start = time.time()
@@ -505,19 +537,18 @@ def _run_realtime_feed():
             # === PIN SETTLE ===
             elif state == "pin_settle":
                 _draw_boundaries(vis_frame, calibrator)
-                settle_time = rt_config.PIN_SETTLE_FRAMES / rt_config.CAMERA_FPS
+                settle_time = getattr(rt_config, 'PIN_SETTLE_FRAMES', 60) / getattr(rt_config, 'CAMERA_FPS', 30)
                 elapsed = time.time() - pin_settle_start
+                pct = min(elapsed / settle_time, 1.0)
 
-                cv2.putText(
-                    vis_frame,
-                    f"Pins settling... {elapsed:.1f}s / {settle_time:.1f}s",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
-                )
+                _draw_text_with_bg(vis_frame,
+                                   f"Pins settling... {elapsed:.1f}s / {settle_time:.1f}s",
+                                   (10, 40), scale=0.9, color=(0, 255, 255))
+                state_placeholder.info(f"Waiting for pins to settle... {int(pct * 100)}%")
 
                 if elapsed >= settle_time:
                     pins = _detect_pins_realtime(before_frame, frame, calibrator, rt_config)
                     st.session_state.rt_throws.append(pins)
-                    metrics_placeholder.metric("Last throw", f"{pins} pins")
                     state = "result"
                     result_start = time.time()
 
@@ -527,29 +558,51 @@ def _run_realtime_feed():
                 throws = st.session_state.rt_throws
                 last = throws[-1] if throws else 0
 
-                cv2.putText(
-                    vis_frame, f"PINS DOWN: {last}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3,
-                )
+                _draw_text_with_bg(vis_frame, f"PINS DOWN: {last}/10",
+                                   (10, 50), scale=1.4, color=(0, 255, 0), thickness=3)
+                metrics_placeholder.metric("Last Throw", f"{last} pins")
+                state_placeholder.success(f"Result: {last} pins down!")
+
+                # Update throws display
+                if throws:
+                    throws_placeholder.write(
+                        f"**Session:** {len(throws)} throws | "
+                        f"Pins: {', '.join(str(t) for t in throws)} | "
+                        f"Avg: {sum(throws)/len(throws):.1f}"
+                    )
 
                 if time.time() - result_start > 3.0:
-                    tracker.reset()
+                    if tracker:
+                        tracker.reset()
                     before_frame = frame.copy()
                     state = "waiting"
-                    status_placeholder.success("Ready for next throw!")
 
-            # Display frame (BGR -> RGB for Streamlit)
+            # Display frame (BGR -> RGB)
             frame_placeholder.image(
                 cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB),
                 channels="RGB",
                 use_container_width=True,
             )
 
-            # Streamlit needs a small sleep to process UI events (stop button)
             time.sleep(0.03)
 
     finally:
         cap.release()
+        lane_config.NUM_COLLECTION_FRAMES = original_num
+
+
+def _draw_text_with_bg(frame, text, pos, scale=0.8, color=(255, 255, 255),
+                       thickness=2, bg_color=(0, 0, 0), bg_alpha=0.6):
+    """Draw text with a semi-transparent background for readability."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x, y = pos
+    pad = 6
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - pad, y - th - pad), (x + tw + pad, y + pad + baseline),
+                  bg_color, -1)
+    cv2.addWeighted(overlay, bg_alpha, frame, 1 - bg_alpha, 0, frame)
+    cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
 def _draw_boundaries(frame, calibrator):
