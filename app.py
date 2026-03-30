@@ -452,11 +452,13 @@ def _run_calibration_phase():
                 st.session_state.rt_boundaries = calibrator.boundaries
                 st.session_state.rt_before_frame = frame.copy()
 
-                # Save a snapshot of the calibrated view
+                # Save a snapshot of the calibrated view WITH boundaries
                 vis_cal = frame.copy()
                 calibrator.draw_boundaries(vis_cal)
                 _draw_text_with_bg(vis_cal, "CALIBRATED", (10, 35), scale=1.0, color=(0, 255, 0))
-                frame_placeholder.image(cv2.cvtColor(vis_cal, cv2.COLOR_BGR2RGB),
+                # Store RGB snapshot for display in Ready phase
+                st.session_state.rt_calibration_snapshot = cv2.cvtColor(vis_cal, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(st.session_state.rt_calibration_snapshot,
                                         channels="RGB", use_container_width=True)
 
             time.sleep(0.03)
@@ -481,13 +483,40 @@ def _show_ready_phase():
     """Show calibrated lane and controls."""
     st.subheader("Lane Calibrated - Ready to Bowl")
 
+    # Show calibration snapshot with boundaries drawn
+    snapshot = st.session_state.get("rt_calibration_snapshot")
+    if snapshot is not None:
+        st.image(snapshot, channels="RGB", use_container_width=True,
+                 caption="Detected lane boundaries (Red=foul line, Blue=sides, Green=top)")
+
     # Show boundaries info
     b = st.session_state.rt_boundaries
     if b:
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Foul Line", f"Y={b['foul_line_y']}")
-        col2.metric("Lane Left", f"X={b['left_x']}")
-        col3.metric("Lane Right", f"X={b['right_x']}")
+        col2.metric("Left", f"X={b['left_x']}")
+        col3.metric("Right", f"X={b['right_x']}")
+        col4.metric("Top", f"Y={b.get('top_y', '?')}")
+
+    # Live preview button
+    if st.button("Refresh Live Preview", help="Take a new snapshot from the camera"):
+        try:
+            cap = cv2.VideoCapture(st.session_state.rt_camera_idx)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    calibrator = st.session_state.rt_calibrator
+                    if calibrator:
+                        calibrator.draw_boundaries(frame)
+                    st.session_state.rt_calibration_snapshot = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    st.rerun()
+            else:
+                st.warning("Cannot open camera for preview.")
+        except Exception as e:
+            st.warning(f"Preview failed: {e}")
 
     st.divider()
 

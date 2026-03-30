@@ -1,155 +1,183 @@
 """
 Core trajectory reconstruction logic - Phase 3
 
-Adapts the homography-based reconstruction from the worcester codebase
-to work with bowling-cv's boundary_data.json and ball trajectory CSV formats.
+Uses the exact same homography approach as bowling-analysis (worcester):
+1. Convert boundary_data.json to per-frame Lane_points.csv (worcester format)
+2. Convert ball trajectory CSV to worcester format (frame,x,y,radius)
+3. Apply per-frame homography to map ball positions to lane coordinates (106x1829)
+4. Post-process: outlier removal, median filter, Savitzky-Golay smoothing
 
-The pipeline:
-1. Read boundary_data.json -> extract 4 corner intersections
-2. Build a per-frame lane corners CSV (static boundaries = same corners every frame)
-3. Compute homography per frame mapping image corners to lane-space rectangle
-4. Transform ball (x, y+radius) positions through the homography
-5. Apply Savitzky-Golay smoothing to the transformed trajectory
-
-Version: 1.0.0
-Authors: Pedro Roriz
-Created: March 30, 2026
+Version: 2.0.0
 """
 
 import json
 import os
+from collections import deque
 
 import cv2
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
+from scipy.signal import medfilt, savgol_filter
+
+
+# Lane dimensions in cm (standard bowling lane)
+LANE_WIDTH = 106
+LANE_LENGTH = 1829
 
 
 # ==============================================================================
-#                         BOUNDARY -> LANE CORNERS
+#                 ADAPTER: boundary_data.json -> Lane_points.csv
 # ==============================================================================
+
+
+def _line_y_at_x(line_data, x):
+    """Compute Y coordinate of a master line at a given X."""
+    x_top = line_data['x_top']
+    y_top = line_data['y_top']
+    x_bottom = line_data['x_bottom']
+    y_bottom = line_data['y_bottom']
+    if x_bottom == x_top:
+        return y_top
+    slope = (y_bottom - y_top) / (x_bottom - x_top)
+    return y_top + slope * (x - x_top)
+
+
+def _line_x_at_y(line_data, y):
+    """Compute X coordinate of a master line at a given Y."""
+    x_top = line_data['x_top']
+    y_top = line_data['y_top']
+    x_bottom = line_data['x_bottom']
+    y_bottom = line_data['y_bottom']
+    if y_bottom == y_top:
+        return x_top
+    t = (y - y_top) / (y_bottom - y_top)
+    return x_top + t * (x_bottom - x_top)
 
 
 def convert_boundary_json_to_lane_csv(boundary_json_path, output_csv_path=None, num_frames=None):
     """
-    Reads bowling-cv's boundary_data.json (which stores static lane boundaries)
-    and produces a per-frame CSV with the 4 lane corner positions.
+    Convert bowling-cv's boundary_data.json to worcester's Lane_points.csv format.
 
-    The boundary_data.json already contains pre-computed intersection points:
-        intersections.top_left     {x, y}
-        intersections.top_right    {x, y}
-        intersections.bottom_left  {x, y}
-        intersections.bottom_right {x, y}
+    worcester format (per-frame, 9 columns):
+        Frame,bottom_left_x,bottom_left_y,bottom_right_x,bottom_right_y,
+        up_left_x,up_left_y,up_right_x,up_right_y
 
-    Since boundaries are static (detected once from the whole video), every
-    frame gets the same 4 corners.
-
-    Parameters
-    ----------
-    boundary_json_path : str
-        Path to boundary_data.json from Phase 1.
-    output_csv_path : str, optional
-        Where to write the CSV. If None, the CSV is not saved to disk.
-    num_frames : int, optional
-        Number of frames to generate rows for. If None, generates a single row
-        with Frame=0 (sufficient when homography is constant).
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: Frame, tl_x, tl_y, tr_x, tr_y,
-                                 bl_x, bl_y, br_x, br_y
+    The 4 corners are computed from the intersections of the master lines
+    with the foul line (bottom) and top boundary.
     """
     with open(boundary_json_path, 'r') as f:
-        boundary_data = json.load(f)
+        bd = json.load(f)
 
-    intersections = boundary_data['intersections']
+    left = bd['master_left']
+    right = bd['master_right']
+    foul_y = bd['median_foul_params']['center_y']
 
-    # Extract the 4 corners from pre-computed intersections
-    tl = intersections['top_left']
-    tr = intersections['top_right']
-    bl = intersections['bottom_left']
-    br = intersections['bottom_right']
+    # Top boundary Y
+    top_info = bd.get('top_boundary', {})
+    top_y = top_info.get('y_position')
+    if top_y is None:
+        # Try line endpoints
+        line_left = top_info.get('line_left')
+        line_right = top_info.get('line_right')
+        if line_left and line_right:
+            top_y = int((line_left[1] + line_right[1]) / 2)
+        else:
+            top_y = int(foul_y * 0.12)  # estimate
 
-    corners = {
-        'tl_x': tl['x'], 'tl_y': tl['y'],
-        'tr_x': tr['x'], 'tr_y': tr['y'],
-        'bl_x': bl['x'], 'bl_y': bl['y'],
-        'br_x': br['x'], 'br_y': br['y'],
-    }
+    # Compute 4 corners: intersections of left/right lines with foul/top
+    bl_x = _line_x_at_y(left, foul_y)
+    bl_y = foul_y
+    br_x = _line_x_at_y(right, foul_y)
+    br_y = foul_y
+    ul_x = _line_x_at_y(left, top_y)
+    ul_y = top_y
+    ur_x = _line_x_at_y(right, top_y)
+    ur_y = top_y
 
-    # Build DataFrame - one row per frame (or single row if num_frames is None)
-    if num_frames is not None and num_frames > 0:
-        rows = []
-        for frame_idx in range(num_frames):
-            row = {'Frame': frame_idx}
-            row.update(corners)
-            rows.append(row)
-        df = pd.DataFrame(rows)
-    else:
-        df = pd.DataFrame([{'Frame': 0, **corners}])
+    if num_frames is None or num_frames <= 0:
+        num_frames = 1
 
-    if output_csv_path is not None:
-        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+    rows = []
+    for i in range(num_frames):
+        rows.append({
+            'Frame': i,
+            'bottom_left_x': bl_x, 'bottom_left_y': bl_y,
+            'bottom_right_x': br_x, 'bottom_right_y': br_y,
+            'up_left_x': ul_x, 'up_left_y': ul_y,
+            'up_right_x': ur_x, 'up_right_y': ur_y,
+        })
+
+    df = pd.DataFrame(rows)
+
+    if output_csv_path:
+        os.makedirs(os.path.dirname(output_csv_path) or '.', exist_ok=True)
         df.to_csv(output_csv_path, index=False)
-        print(f"  Lane corners CSV saved to {output_csv_path}")
 
     return df
 
 
 # ==============================================================================
-#                         HOMOGRAPHY COMPUTATION
+#                 ADAPTER: ball CSV format conversion
 # ==============================================================================
 
 
-def compute_homographies_per_frame(lane_csv_path, width, height):
+def convert_ball_csv_to_worcester(input_csv_path, output_csv_path=None):
     """
-    Reads the lane corners CSV and computes a homography matrix for each frame.
+    Convert bowling-cv ball detection CSV to worcester format.
 
-    The homography maps the 4 image-space lane corners to a destination
-    rectangle of size (width x height) representing the lane in real-world
-    coordinates (inches or cm).
-
-    Parameters
-    ----------
-    lane_csv_path : str or pd.DataFrame
-        Path to the lane corners CSV, or a DataFrame directly.
-    width : int
-        Destination width (e.g. LANE_WIDTH = 106).
-    height : int
-        Destination height (e.g. LANE_LENGTH = 1829).
-
-    Returns
-    -------
-    dict
-        {frame_number: 3x3 homography matrix}
+    bowling-cv format: frame,x,y,radius_x,radius_y,radius_fitted
+    worcester format:  frame,x,y,radius
     """
-    if isinstance(lane_csv_path, pd.DataFrame):
-        df = lane_csv_path
+    df = pd.read_csv(input_csv_path)
+
+    # Map radius column
+    if 'radius' not in df.columns:
+        if 'radius_fitted' in df.columns:
+            df['radius'] = df['radius_fitted']
+        elif 'radius_x' in df.columns:
+            df['radius'] = df['radius_x']
+        else:
+            raise ValueError(f"No radius column found in {input_csv_path}. "
+                             f"Columns: {list(df.columns)}")
+
+    out = df[['frame', 'x', 'y', 'radius']].copy()
+
+    if output_csv_path:
+        os.makedirs(os.path.dirname(output_csv_path) or '.', exist_ok=True)
+        out.to_csv(output_csv_path, index=False)
+
+    return out
+
+
+# ==============================================================================
+#          HOMOGRAPHY (same logic as worcester Reconstruction.py)
+# ==============================================================================
+
+
+def compute_homographies_per_frame(lane_csv, width=LANE_WIDTH, height=LANE_LENGTH):
+    """
+    Compute a homography matrix for each frame from lane corner points.
+    Identical to worcester's compute_homographies_per_frame.
+    """
+    if isinstance(lane_csv, pd.DataFrame):
+        df = lane_csv
     else:
-        df = pd.read_csv(lane_csv_path)
+        df = pd.read_csv(lane_csv)
 
     homographies = {}
 
     for _, row in df.iterrows():
         frame = int(row['Frame'])
 
-        # Source points: 4 lane corners in image space
-        # Order: bottom-left, bottom-right, top-right, top-left
         pts_src = np.array([
-            [row['bl_x'], row['bl_y']],
-            [row['br_x'], row['br_y']],
-            [row['tr_x'], row['tr_y']],
-            [row['tl_x'], row['tl_y']],
+            [row['bottom_left_x'], row['bottom_left_y']],
+            [row['bottom_right_x'], row['bottom_right_y']],
+            [row['up_right_x'], row['up_right_y']],
+            [row['up_left_x'], row['up_left_y']],
         ], dtype=np.float32)
 
-        # Destination points: rectangle in lane coordinates
-        # Bottom of lane (foul line) = y=height, Top (pins) = y=0
         pts_dst = np.array([
-            [0, height],
-            [width, height],
-            [width, 0],
-            [0, 0],
+            [0, height], [width, height], [width, 0], [0, 0],
         ], dtype=np.float32)
 
         H, _ = cv2.findHomography(pts_src, pts_dst)
@@ -159,169 +187,157 @@ def compute_homographies_per_frame(lane_csv_path, width, height):
     return homographies
 
 
-# ==============================================================================
-#                    BALL POSITION TRANSFORMATION
-# ==============================================================================
-
-
-def apply_homography_per_frame(ball_csv_path, homographies, output_csv_path=None):
+def apply_homography_per_frame(ball_csv, homographies, output_csv=None):
     """
-    Transforms ball positions from image space to lane coordinates using
-    per-frame homography matrices.
-
-    Uses the bottom of the ball (x, y + radius) as the contact point,
-    matching the worcester reference implementation.
-
-    Parameters
-    ----------
-    ball_csv_path : str
-        Path to ball trajectory CSV with columns: frame, x, y, radius.
-    homographies : dict
-        {frame_number: 3x3 homography matrix} from compute_homographies_per_frame.
-    output_csv_path : str, optional
-        Where to save the transformed CSV. If None, not saved to disk.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: frame, x, y (in lane coordinates).
+    Transform ball positions using per-frame homography.
+    Uses bottom-of-ball point (x, y+radius) as contact point.
+    Identical to worcester's apply_homography_per_frame.
     """
-    df = pd.read_csv(ball_csv_path)
-    transformed_data = []
+    if isinstance(ball_csv, pd.DataFrame):
+        df = ball_csv
+    else:
+        df = pd.read_csv(ball_csv)
+
+    transformed = []
 
     for _, row in df.iterrows():
         frame_id = int(row['frame'])
-        x, y = row['x'], row['y']
+        x, y, r = row['x'], row['y'], row['radius']
 
-        # Handle missing values
-        if pd.isna(x) or pd.isna(y):
-            transformed_data.append([frame_id, np.nan, np.nan])
+        if pd.isna(x) or pd.isna(y) or pd.isna(r):
+            transformed.append([frame_id, np.nan, np.nan])
             continue
 
-        # Use radius if available for bottom-of-ball contact point
-        r = row.get('radius', 0)
-        if pd.isna(r):
-            r = 0
-
-        # Since boundaries are static, all frames share the same homography
-        # Try the exact frame first, then fall back to frame 0
         H = homographies.get(frame_id)
         if H is None:
             H = homographies.get(0)
+        if H is None and homographies:
+            H = next(iter(homographies.values()))
         if H is None:
-            # Use any available homography (they're all the same for static boundaries)
-            if homographies:
-                H = next(iter(homographies.values()))
-            else:
-                continue
+            continue
 
-        # Transform bottom-of-ball point
         point = np.array([[[x, y + r]]], dtype=np.float32)
-        transformed_point = cv2.perspectiveTransform(point, H)[0][0]
-        transformed_data.append([frame_id, transformed_point[0], transformed_point[1]])
+        tp = cv2.perspectiveTransform(point, H)[0][0]
+        transformed.append([frame_id, tp[0], tp[1]])
 
-    transformed_df = pd.DataFrame(transformed_data, columns=['frame', 'x', 'y'])
+    out_df = pd.DataFrame(transformed, columns=['frame', 'x', 'y'])
 
-    if output_csv_path is not None:
-        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-        transformed_df.to_csv(output_csv_path, index=False)
-        print(f"  Transformed positions saved to {output_csv_path}")
+    if output_csv:
+        os.makedirs(os.path.dirname(output_csv) or '.', exist_ok=True)
+        out_df.to_csv(output_csv, index=False)
 
-    return transformed_df
+    return out_df
 
 
 # ==============================================================================
-#                         TRAJECTORY SMOOTHING
+#      POST-PROCESSING (same logic as worcester Post_processing_positions.py)
 # ==============================================================================
 
 
-def smooth_trajectory(df, window_length=61, polyorder=2):
-    """
-    Apply Savitzky-Golay filter to smooth the transformed trajectory.
-
-    Only smooths rows with valid (non-NaN) x and y values.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame with columns: frame, x, y.
-    window_length : int
-        Window length for savgol_filter (must be odd).
-    polyorder : int
-        Polynomial order for savgol_filter.
-
-    Returns
-    -------
-    pd.DataFrame
-        Smoothed DataFrame with same columns.
-    """
+def _remove_low_y(df):
+    """Remove out-of-bounds y coordinates."""
     df = df.copy()
+    df['y'] = pd.to_numeric(df['y'], errors='coerce')
+    mask = (df['y'] > LANE_LENGTH - 80) | (df['y'] < 30)
+    df.loc[mask, ['x', 'y']] = np.nan
+    return df
 
-    # Only smooth valid (non-NaN) rows
-    valid_mask = df['x'].notna() & df['y'].notna()
-    valid_count = valid_mask.sum()
 
-    if valid_count < window_length:
-        # Not enough points to smooth - adjust window or skip
-        if valid_count >= 5:
-            # Use a smaller window
-            adjusted_window = valid_count if valid_count % 2 == 1 else valid_count - 1
-            adjusted_window = max(adjusted_window, polyorder + 2)
-            if adjusted_window % 2 == 0:
-                adjusted_window -= 1
-            print(f"  Warning: Only {valid_count} valid points. "
-                  f"Adjusted smoothing window from {window_length} to {adjusted_window}.")
-            window_length = adjusted_window
-        else:
-            print(f"  Warning: Only {valid_count} valid points. Skipping smoothing.")
-            return df
+def _remove_rolling_outliers(df, threshold=2.5, window_size=2):
+    """Remove outliers using rolling median absolute deviation."""
+    df = df.copy()
+    initial_nan = df[['x', 'y']].isna().any(axis=1)
 
-    df.loc[valid_mask, 'x'] = savgol_filter(
-        df.loc[valid_mask, 'x'].values,
-        window_length=window_length,
-        polyorder=polyorder
-    )
-    df.loc[valid_mask, 'y'] = savgol_filter(
-        df.loc[valid_mask, 'y'].values,
-        window_length=window_length,
-        polyorder=polyorder
-    )
+    def rolling_median_mad(values, ws):
+        medians, mads = [], []
+        window = deque(maxlen=ws)
+        for v in values:
+            window.append(v)
+            if len(window) == ws:
+                med = np.median(window)
+                mad = np.median(np.abs(np.array(window) - med))
+                medians.append(med)
+                mads.append(mad)
+            else:
+                medians.append(np.nan)
+                mads.append(np.nan)
+        return np.array(medians), np.array(mads)
 
+    x_med, _ = rolling_median_mad(df['x'].values, window_size)
+    y_med, _ = rolling_median_mad(df['y'].values, window_size)
+
+    distances = np.sqrt((df['x'].values - x_med) ** 2 + (df['y'].values - y_med) ** 2)
+    med_dist = np.nanmedian(distances)
+    mad_dist = np.nanmedian(np.abs(distances - med_dist))
+
+    if mad_dist == 0:
+        return df
+
+    mod_z = 0.6745 * (distances - med_dist) / mad_dist
+    outliers = (np.abs(mod_z) >= threshold) & ~initial_nan
+    df.loc[outliers, ['x', 'y']] = np.nan
+    return df
+
+
+def _median_filter(df, kernel_size=3):
+    """Apply median filter and remove non-positive values."""
+    df = df.copy()
+    df['x'] = medfilt(df['x'], kernel_size=kernel_size)
+    df['y'] = medfilt(df['y'], kernel_size=kernel_size)
+    df = df[df['x'] > 0]
+    df = df[df['y'] > 0]
+    return df
+
+
+def _savgol_smooth(df, window_length=45, polyorder=3):
+    """Apply Savitzky-Golay filter."""
+    df = df.copy()
+    n = len(df)
+    if n < window_length:
+        window_length = n if n % 2 == 1 else n - 1
+    if window_length <= polyorder:
+        return df
+    df['x'] = savgol_filter(df['x'], window_length=window_length, polyorder=polyorder)
+    df['y'] = savgol_filter(df['y'], window_length=window_length, polyorder=polyorder)
+    return df
+
+
+def _interpolate_missing(df):
+    """Interpolate missing coordinates and apply final smoothing."""
+    df = df.copy().set_index('frame')
+    full_idx = range(df.index.min(), df.index.max() + 1)
+    df = df.reindex(full_idx)
+    df['x'] = df['x'].interpolate(method='linear').bfill().ffill()
+    df['y'] = df['y'].interpolate(method='linear').bfill().ffill()
+    df = df.reset_index().rename(columns={'index': 'frame'})
+    df = _savgol_smooth(df)
+    return df
+
+
+def post_process_transformed(df):
+    """Full post-processing pipeline (same as worcester)."""
+    df = _remove_low_y(df)
+    df = _remove_rolling_outliers(df)
+    df = _median_filter(df)
+    df = _interpolate_missing(df)
     return df
 
 
 # ==============================================================================
-#                         MAIN ENTRY POINT
+#                           MAIN ENTRY POINT
 # ==============================================================================
 
 
 def process_reconstruction(video_name, config=None):
     """
-    Main entry point: runs the full trajectory reconstruction pipeline.
+    Full trajectory reconstruction pipeline.
 
-    Steps:
-    1. Read boundary_data.json -> lane corners CSV
-    2. Compute per-frame homography
-    3. Transform ball positions to lane coordinates
-    4. Smooth the trajectory
-    5. Save outputs
-
-    Parameters
-    ----------
-    video_name : str
-        Name of the video (without extension), e.g. 'cropped_test3'.
-    config : module, optional
-        Configuration module. If None, uses this module's default config.
-
-    Returns
-    -------
-    dict
-        Dictionary with keys:
-            'lane_corners_df': DataFrame of lane corners
-            'transformed_df': raw transformed positions
-            'smoothed_df': smoothed transformed positions
-            'homographies': dict of homography matrices
-            'output_dir': path to output directory
+    1. Convert boundary_data.json -> Lane_points.csv (worcester format)
+    2. Convert ball CSV -> worcester format (frame,x,y,radius)
+    3. Compute per-frame homographies
+    4. Transform ball positions to lane coordinates
+    5. Post-process (outlier removal, smoothing, interpolation)
+    6. Generate visualization
     """
     if config is None:
         from . import config
@@ -334,81 +350,74 @@ def process_reconstruction(video_name, config=None):
     print(f"Phase 3: Trajectory Reconstruction - {video_name}")
     print(f"{'='*60}")
 
-    # --- Step 1: Convert boundary data to lane corners ---
-    boundary_json_path = os.path.join(output_base, config.BOUNDARY_DATA_FILENAME)
-    if not os.path.exists(boundary_json_path):
-        raise FileNotFoundError(
-            f"Boundary data not found: {boundary_json_path}\n"
-            f"Run Phase 1 (lane detection) first."
-        )
+    # --- Step 1: Convert boundary data to Lane_points.csv ---
+    boundary_json = os.path.join(output_base, config.BOUNDARY_DATA_FILENAME)
+    if not os.path.exists(boundary_json):
+        raise FileNotFoundError(f"Not found: {boundary_json}. Run Phase 1 first.")
 
-    lane_corners_csv = os.path.join(output_dir, 'lane_corners.csv') if config.SAVE_LANE_CORNERS_CSV else None
+    # Get frame count from ball CSV
+    ball_csv_orig = os.path.join(output_base, config.BALL_TRAJECTORY_FILENAME)
+    if not os.path.exists(ball_csv_orig):
+        raise FileNotFoundError(f"Not found: {ball_csv_orig}. Run Phase 2 first.")
 
-    print(f"\nStep 1: Converting boundary data to lane corners...")
-    lane_corners_df = convert_boundary_json_to_lane_csv(
-        boundary_json_path,
-        output_csv_path=lane_corners_csv
-    )
-    print(f"  Corners: TL=({lane_corners_df.iloc[0]['tl_x']:.0f}, {lane_corners_df.iloc[0]['tl_y']:.0f}), "
-          f"TR=({lane_corners_df.iloc[0]['tr_x']:.0f}, {lane_corners_df.iloc[0]['tr_y']:.0f}), "
-          f"BL=({lane_corners_df.iloc[0]['bl_x']:.0f}, {lane_corners_df.iloc[0]['bl_y']:.0f}), "
-          f"BR=({lane_corners_df.iloc[0]['br_x']:.0f}, {lane_corners_df.iloc[0]['br_y']:.0f})")
+    ball_df_orig = pd.read_csv(ball_csv_orig)
+    num_frames = int(ball_df_orig['frame'].max()) + 1
 
-    # --- Step 2: Compute homographies ---
-    print(f"\nStep 2: Computing homographies...")
-    print(f"  Lane dimensions: {config.LANE_WIDTH} x {config.LANE_LENGTH}")
-    homographies = compute_homographies_per_frame(
-        lane_corners_df, config.LANE_WIDTH, config.LANE_LENGTH
-    )
-    print(f"  Computed {len(homographies)} homography matrices")
+    lane_csv = os.path.join(output_dir, 'Lane_points.csv')
+    print(f"\nStep 1: Converting boundary data to lane corners ({num_frames} frames)...")
+    lane_df = convert_boundary_json_to_lane_csv(boundary_json, lane_csv, num_frames)
+    row0 = lane_df.iloc[0]
+    print(f"  BL=({row0['bottom_left_x']:.0f},{row0['bottom_left_y']:.0f}) "
+          f"BR=({row0['bottom_right_x']:.0f},{row0['bottom_right_y']:.0f}) "
+          f"UL=({row0['up_left_x']:.0f},{row0['up_left_y']:.0f}) "
+          f"UR=({row0['up_right_x']:.0f},{row0['up_right_y']:.0f})")
 
-    # --- Step 3: Transform ball positions ---
-    ball_csv_path = os.path.join(output_base, config.BALL_TRAJECTORY_FILENAME)
-    if not os.path.exists(ball_csv_path):
-        raise FileNotFoundError(
-            f"Ball trajectory not found: {ball_csv_path}\n"
-            f"Run Phase 2 (ball detection) first."
-        )
+    # --- Step 2: Convert ball CSV to worcester format ---
+    ball_csv = os.path.join(output_dir, 'ball_positions.csv')
+    print(f"\nStep 2: Converting ball CSV to standard format...")
+    ball_df = convert_ball_csv_to_worcester(ball_csv_orig, ball_csv)
+    print(f"  {len(ball_df)} ball positions, radius column mapped")
 
-    transformed_csv = os.path.join(output_dir, 'transformed_positions.csv') if config.SAVE_TRANSFORMED_CSV else None
+    # --- Step 3: Compute homographies ---
+    print(f"\nStep 3: Computing per-frame homographies (lane {LANE_WIDTH}x{LANE_LENGTH})...")
+    homographies = compute_homographies_per_frame(lane_csv, LANE_WIDTH, LANE_LENGTH)
+    print(f"  {len(homographies)} homography matrices computed")
 
-    print(f"\nStep 3: Transforming ball positions to lane coordinates...")
-    transformed_df = apply_homography_per_frame(
-        ball_csv_path, homographies, output_csv_path=transformed_csv
-    )
-    valid_count = transformed_df['x'].notna().sum()
-    print(f"  Transformed {valid_count} valid positions out of {len(transformed_df)} frames")
+    # --- Step 4: Transform positions ---
+    raw_csv = os.path.join(output_dir, 'transformed_positions_raw.csv')
+    print(f"\nStep 4: Transforming ball positions to lane coordinates...")
+    raw_df = apply_homography_per_frame(ball_csv, homographies, raw_csv)
+    valid = raw_df['x'].notna().sum()
+    print(f"  {valid} valid transformed positions")
 
-    # --- Step 4: Smooth trajectory ---
-    print(f"\nStep 4: Smoothing trajectory (window={config.SAVGOL_WINDOW}, order={config.SAVGOL_POLYORDER})...")
-    smoothed_df = smooth_trajectory(
-        transformed_df,
-        window_length=config.SAVGOL_WINDOW,
-        polyorder=config.SAVGOL_POLYORDER
-    )
+    # --- Step 5: Post-process ---
+    print(f"\nStep 5: Post-processing (outlier removal + smoothing)...")
+    processed_df = post_process_transformed(raw_df)
+    processed_csv = os.path.join(output_dir, 'transformed_positions_smoothed.csv')
+    processed_df.to_csv(processed_csv, index=False)
+    print(f"  {len(processed_df)} final points saved to {processed_csv}")
 
-    if config.SAVE_SMOOTHED_CSV:
-        smoothed_csv = os.path.join(output_dir, 'transformed_positions_smoothed.csv')
-        smoothed_df.to_csv(smoothed_csv, index=False)
-        print(f"  Smoothed trajectory saved to {smoothed_csv}")
-
-    # --- Step 5: Generate visualization ---
+    # --- Step 6: Visualization ---
     if config.SAVE_VISUALIZATION_VIDEO:
-        print(f"\nStep 5: Generating overhead visualization video...")
+        print(f"\nStep 6: Generating overhead visualization...")
         from .visualization import generate_overhead_video
-        vis_path = generate_overhead_video(smoothed_df, output_dir, video_name, config)
+        vis_path = generate_overhead_video(processed_df, output_dir, video_name, config)
         if vis_path:
-            print(f"  Visualization saved to {vis_path}")
+            print(f"  Saved to {vis_path}")
 
+    valid_final = processed_df.dropna(subset=['x', 'y'])
     print(f"\n{'='*60}")
     print(f"Phase 3 complete for {video_name}")
-    print(f"Output directory: {output_dir}")
+    print(f"  Points: {len(valid_final)}")
+    if len(valid_final) > 0:
+        print(f"  X range: {valid_final['x'].min():.1f} - {valid_final['x'].max():.1f} (lane width: {LANE_WIDTH})")
+        print(f"  Y range: {valid_final['y'].min():.1f} - {valid_final['y'].max():.1f} (lane length: {LANE_LENGTH})")
     print(f"{'='*60}\n")
 
     return {
-        'lane_corners_df': lane_corners_df,
-        'transformed_df': transformed_df,
-        'smoothed_df': smoothed_df,
+        'lane_corners_df': lane_df,
+        'transformed_df': raw_df,
+        'smoothed_df': processed_df,
         'homographies': homographies,
         'output_dir': output_dir,
     }

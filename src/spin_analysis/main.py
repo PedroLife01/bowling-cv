@@ -67,14 +67,24 @@ def main():
     video_path = args.video
     video_name = Path(video_path).stem
 
-    # Auto-detect ball trajectory CSV
+    # Auto-detect ball trajectory CSV (prefer worcester Adjusted_positions)
     if args.ball_csv:
         ball_csv_path = args.ball_csv
     else:
-        ball_csv_path = os.path.join(
-            config.OUTPUT_DIR, video_name,
-            'ball_detection', 'trajectory_processed_original.csv'
-        )
+        ball_dir = os.path.join(config.OUTPUT_DIR, video_name, 'ball_detection')
+        candidates = [
+            os.path.join(ball_dir, 'Adjusted_positions.csv'),
+            os.path.join(ball_dir, 'ball_positions.csv'),
+            os.path.join(ball_dir, 'Circle_positions_cleaned.csv'),
+            os.path.join(ball_dir, 'trajectory_processed_original.csv'),
+        ]
+        ball_csv_path = None
+        for c in candidates:
+            if os.path.exists(c):
+                ball_csv_path = c
+                break
+        if ball_csv_path is None:
+            ball_csv_path = candidates[-1]  # default for error message
 
     # Output directory
     output_dir = os.path.join(config.OUTPUT_DIR, video_name, 'spin_analysis')
