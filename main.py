@@ -4,7 +4,9 @@ Main entry point for Bowling Computer Vision Pipeline.
 Orchestrates all phases of the bowling analysis system:
 - Phase 1: Lane Detection (boundary detection)
 - Phase 2: Ball Detection (trajectory tracking)
+- Phase 3: Trajectory Reconstruction (homography-based 2D lane mapping)
 - Phase 4: Pin Detection (toppled pin counting)
+- Phase 5: Spin/Rotation Analysis (optical flow + Kabsch algorithm)
 
 Can run individual phases or the complete end-to-end pipeline.
 
@@ -19,11 +21,14 @@ Usage:
     # Run individual phases
     python main.py --phase 1              # Lane detection only
     python main.py --phase 2              # Ball detection only
+    python main.py --phase 3              # Trajectory reconstruction only
     python main.py --phase 4              # Pin detection only
-    
+    python main.py --phase 5              # Spin analysis only
+
     # Run specific combinations
     python main.py --phase 1 --phase 2    # Lane + Ball
     python main.py --phase 2 --phase 4    # Ball + Pin (requires Phase 1 data)
+    python main.py --phase 3 --phase 5    # Trajectory + Spin (requires Phase 1+2 data)
     
     # Process single video
     python main.py --video cropped_test3.mp4
@@ -69,15 +74,15 @@ Individual Module Entry Points:
     )
     parser.add_argument('--video', type=str, 
                         help='Process single video file (default: process all configured videos)')
-    parser.add_argument('--phase', type=int, action='append', choices=[1, 2, 4],
+    parser.add_argument('--phase', type=int, action='append', choices=[1, 2, 3, 4, 5],
                         help='Run specific phase(s). Can be specified multiple times. Default: run all phases')
     args = parser.parse_args()
-    
+
     # Determine which phases to run
     if args.phase:
         phases = sorted(set(args.phase))  # Remove duplicates and sort
     else:
-        phases = [1, 2, 4]  # Run all phases by default
+        phases = [1, 2, 3, 4, 5]  # Run all phases by default
     
     # Determine which videos to process
     videos = [args.video] if args.video else None
@@ -98,8 +103,12 @@ Individual Module Entry Points:
             run_phase_1(videos)
         elif phase == 2:
             run_phase_2(videos)
+        elif phase == 3:
+            run_phase_3(videos)
         elif phase == 4:
             run_phase_4(videos)
+        elif phase == 5:
+            run_phase_5(videos)
     
     # Final summary
     print(f"\n{'#'*80}")
@@ -166,6 +175,34 @@ def run_phase_2(videos=None):
         sys.argv = original_argv
 
 
+def run_phase_3(videos=None):
+    """
+    Run Phase 3: Trajectory Reconstruction
+
+    Parameters:
+    -----------
+    videos : list, optional
+        List of video files to process. If None, uses configured videos.
+    """
+    print(f"\n{'='*80}")
+    print(f"PHASE 3: TRAJECTORY RECONSTRUCTION")
+    print(f"{'='*80}\n")
+
+    from trajectory_3d.main import main as trajectory_main
+    import sys
+
+    original_argv = sys.argv
+    args = ['main.py']
+    if videos:
+        args.extend(['--video', videos[0]])
+
+    sys.argv = args
+    try:
+        trajectory_main()
+    finally:
+        sys.argv = original_argv
+
+
 def run_phase_4(videos=None):
     """
     Run Phase 4: Pin Detection
@@ -191,6 +228,34 @@ def run_phase_4(videos=None):
     sys.argv = args
     try:
         pin_main()
+    finally:
+        sys.argv = original_argv
+
+
+def run_phase_5(videos=None):
+    """
+    Run Phase 5: Spin/Rotation Analysis
+
+    Parameters:
+    -----------
+    videos : list, optional
+        List of video files to process. If None, uses configured videos.
+    """
+    print(f"\n{'='*80}")
+    print(f"PHASE 5: SPIN/ROTATION ANALYSIS")
+    print(f"{'='*80}\n")
+
+    from spin_analysis.main import main as spin_main
+    import sys
+
+    original_argv = sys.argv
+    args = ['main.py']
+    if videos:
+        args.extend(['--video', videos[0]])
+
+    sys.argv = args
+    try:
+        spin_main()
     finally:
         sys.argv = original_argv
 
