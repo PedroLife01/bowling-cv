@@ -1,25 +1,25 @@
 """
 Streamlit web interface for Bowling CV Analysis Pipeline.
 
-Upload a bowling video and run each analysis phase interactively:
-  Phase 1: Lane Detection
-  Phase 2: Ball Detection
-  Phase 3: Trajectory Reconstruction
-  Phase 4: Pin Detection
-  Phase 5: Spin Analysis
+Two modes:
+  1. Recorded Video: Upload a bowling video and run each phase interactively
+  2. Real-Time: Connect a camera (iPhone via Continuity Camera, USB webcam)
+     for live lane calibration, ball tracking, and pin detection
 
 Usage:
     streamlit run app.py
 """
 
 import base64
+import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
+import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -113,36 +113,33 @@ def main():
     )
     st.title("Bowling CV Analysis Pipeline")
 
-    # Session state
+    tab_recorded, tab_realtime = st.tabs(["Recorded Video", "Real-Time Camera"])
+
+    with tab_recorded:
+        _page_recorded_video()
+
+    with tab_realtime:
+        _page_realtime_camera()
+
+
+# ==============================================================================
+#                          RECORDED VIDEO PAGE
+# ==============================================================================
+
+
+def _page_recorded_video():
+    """Recorded video analysis with 5 phases."""
+
     for key in ("video_path", "video_name"):
         st.session_state.setdefault(key, None)
 
-    # ── Sidebar: Upload & Status ──
-    with st.sidebar:
-        st.header("Video Input")
-        uploaded = st.file_uploader("Upload bowling video", type=["mp4", "avi", "mov"])
-        if uploaded:
-            path = _save_uploaded_video(uploaded)
-            st.session_state.video_path = str(path)
-            st.session_state.video_name = path.stem
-            st.success(f"Saved: {path.name}")
-
-        if st.session_state.video_name:
-            st.divider()
-            st.subheader("Pipeline Status")
-            vn = st.session_state.video_name
-            out = OUTPUT_DIR / vn
-
-            phases = {
-                "Phase 1 - Lane": (out / "boundary_data.json").exists(),
-                "Phase 2 - Ball": (out / "ball_detection").exists(),
-                "Phase 3 - Trajectory": (out / "trajectory_3d").exists(),
-                "Phase 4 - Pins": (out / "pin_detection").exists(),
-                "Phase 5 - Spin": (out / "spin_analysis").exists(),
-            }
-            for name, done in phases.items():
-                icon = "done" if done else "pending"
-                st.write(f"{'[x]' if done else '[ ]'} {name}")
+    # Upload
+    uploaded = st.file_uploader("Upload bowling video", type=["mp4", "avi", "mov"])
+    if uploaded:
+        path = _save_uploaded_video(uploaded)
+        st.session_state.video_path = str(path)
+        st.session_state.video_name = path.stem
+        st.success(f"Saved: {path.name}")
 
     if not st.session_state.video_path:
         st.info("Upload a bowling video to get started.")
@@ -152,10 +149,23 @@ def main():
     video_name = st.session_state.video_name
     video_file = Path(video_path).name
 
-    # ── Phase 1: Lane Detection ──
+    # Pipeline status
+    out = OUTPUT_DIR / video_name
+    with st.sidebar:
+        st.subheader("Pipeline Status")
+        phases = {
+            "Phase 1 - Lane": (out / "boundary_data.json").exists(),
+            "Phase 2 - Ball": (out / "ball_detection").exists(),
+            "Phase 3 - Trajectory": (out / "trajectory_3d").exists(),
+            "Phase 4 - Pins": (out / "pin_detection").exists(),
+            "Phase 5 - Spin": (out / "spin_analysis").exists(),
+        }
+        for name, done in phases.items():
+            st.write(f"{'[x]' if done else '[ ]'} {name}")
+
+    # ── Phase 1 ──
     with st.expander("Phase 1: Lane Detection", expanded=True):
         st.write("Detects lane boundaries (foul line, left/right gutters, pin area).")
-
         if st.button("Run Phase 1", key="run_p1"):
             _run_module(
                 ["src.lane_detection.main", "--video", video_file],
@@ -163,20 +173,17 @@ def main():
             )
             st.rerun()
 
-        # Show results
         boundary_json = OUTPUT_DIR / video_name / "boundary_data.json"
         if boundary_json.exists():
             st.success("Lane boundaries detected.")
-            import json
             with open(boundary_json) as f:
                 data = json.load(f)
             with st.expander("Boundary Data", expanded=False):
                 st.json(data)
 
-    # ── Phase 2: Ball Detection ──
+    # ── Phase 2 ──
     with st.expander("Phase 2: Ball Detection"):
         st.write("Tracks the bowling ball from foul line to pins using MOG2 + Kalman filter.")
-
         if st.button("Run Phase 2", key="run_p2"):
             _run_module(
                 ["src.ball_detection.main", "--video", video_file],
@@ -184,12 +191,9 @@ def main():
             )
             st.rerun()
 
-        # Show results
         ball_dir = OUTPUT_DIR / video_name / "ball_detection"
         if ball_dir.exists():
             st.success("Ball detection complete.")
-
-            # Show trajectory CSV
             traj_csv = ball_dir / "trajectory_processed_original.csv"
             if traj_csv.exists():
                 import pandas as pd
@@ -197,17 +201,14 @@ def main():
                 st.write(f"Trajectory: {len(df)} frames, {df['x'].notna().sum()} valid detections")
                 with st.expander("Trajectory Data", expanded=False):
                     st.dataframe(df.head(50))
-
-            # Show overlay video
             videos = list(ball_dir.glob("*overlay*.mp4")) + list(ball_dir.glob("*Stage_H*.mp4"))
             for v in videos[:1]:
                 web = _reencode_for_web(str(v))
                 _display_video(web)
 
-    # ── Phase 3: Trajectory Reconstruction ──
+    # ── Phase 3 ──
     with st.expander("Phase 3: Trajectory Reconstruction"):
         st.write("Maps ball positions to real-world lane coordinates via homography.")
-
         if st.button("Run Phase 3", key="run_p3"):
             _run_module(
                 ["src.trajectory_3d.main", "--video", video_file],
@@ -218,7 +219,6 @@ def main():
         traj_dir = OUTPUT_DIR / video_name / "trajectory_3d"
         if traj_dir.exists():
             st.success("Trajectory reconstruction complete.")
-
             smoothed_csv = traj_dir / "transformed_positions_smoothed.csv"
             if smoothed_csv.exists():
                 import pandas as pd
@@ -230,17 +230,14 @@ def main():
                     st.write(f"Y range: {valid['y'].min():.1f} - {valid['y'].max():.1f}")
                 with st.expander("Transformed Data", expanded=False):
                     st.dataframe(df.head(50))
-
-            # Show overhead video
             overhead_vids = list(traj_dir.glob("*overhead*.mp4"))
             for v in overhead_vids[:1]:
                 web = _reencode_for_web(str(v))
                 _display_video(web, max_height=600)
 
-    # ── Phase 4: Pin Detection ──
+    # ── Phase 4 ──
     with st.expander("Phase 4: Pin Detection"):
         st.write("Counts toppled pins using frame differencing at impact moment.")
-
         if st.button("Run Phase 4", key="run_p4"):
             _run_module(
                 ["src.pin_detection.main", "--video", video_file],
@@ -251,21 +248,17 @@ def main():
         pin_dir = OUTPUT_DIR / video_name / "pin_detection"
         if pin_dir.exists():
             st.success("Pin detection complete.")
-
-            # Show pin results
             pin_results = list(pin_dir.glob("*.json"))
             if pin_results:
-                import json
                 with open(pin_results[0]) as f:
                     pins = json.load(f)
                 toppled = pins.get("toppled_pins", "?")
                 result = pins.get("result", "?")
                 st.metric("Toppled Pins", f"{toppled}/10", delta=result)
 
-    # ── Phase 5: Spin Analysis ──
+    # ── Phase 5 ──
     with st.expander("Phase 5: Spin Analysis"):
         st.write("Analyzes ball rotation via optical flow + Kabsch algorithm.")
-
         if st.button("Run Phase 5", key="run_p5"):
             _run_module(
                 ["src.spin_analysis.main", "--video", video_path],
@@ -276,27 +269,368 @@ def main():
         spin_dir = OUTPUT_DIR / video_name / "spin_analysis"
         if spin_dir.exists():
             st.success("Spin analysis complete.")
-
             processed_csv = spin_dir / "rotation_data_processed.csv"
             if processed_csv.exists():
                 import pandas as pd
                 df = pd.read_csv(processed_csv)
                 valid = df.dropna(subset=["x_axis"])
                 st.write(f"Rotation data: {len(valid)} valid frames")
-
                 if len(valid) > 0 and "angle" in df.columns:
                     mean_angle = valid["angle"].mean()
-                    fps = 30
-                    st.metric("Avg Angular Velocity", f"{mean_angle * fps:.2f} rad/s")
-
+                    st.metric("Avg Angular Velocity", f"{mean_angle * 30:.2f} rad/s")
                 with st.expander("Rotation Data", expanded=False):
                     st.dataframe(df.head(50))
-
-            # Show sphere video
             sphere_vids = list(spin_dir.glob("*sphere*.mp4"))
             for v in sphere_vids[:1]:
                 web = _reencode_for_web(str(v))
                 _display_video(web)
+
+
+# ==============================================================================
+#                          REAL-TIME CAMERA PAGE
+# ==============================================================================
+
+
+def _detect_cameras() -> list:
+    """Probe camera indices 0-4 and return available ones."""
+    available = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            available.append({"index": i, "resolution": f"{w}x{h}"})
+            cap.release()
+        else:
+            cap.release()
+    return available
+
+
+def _page_realtime_camera():
+    """Real-time camera analysis page."""
+
+    # Init session state for realtime
+    for key in (
+        "rt_running", "rt_camera_idx", "rt_state", "rt_calibrator",
+        "rt_tracker", "rt_throws", "rt_before_frame", "rt_pin_settle_start",
+    ):
+        st.session_state.setdefault(key, None)
+    st.session_state.setdefault("rt_running", False)
+    st.session_state.setdefault("rt_throws", [])
+
+    st.subheader("Real-Time Bowling Analysis")
+    st.write(
+        "Connect your iPhone via USB (Continuity Camera) or a USB webcam. "
+        "The system will calibrate the lane automatically, then track each throw."
+    )
+
+    # Camera selection
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        camera_idx = st.number_input(
+            "Camera index", min_value=0, max_value=10, value=0, step=1,
+            help="0 = built-in webcam, 1 = iPhone Continuity Camera (usually). "
+                 "Try different indices if your camera doesn't appear.",
+        )
+    with col2:
+        if st.button("Detect cameras"):
+            cams = _detect_cameras()
+            if cams:
+                for c in cams:
+                    st.write(f"Camera {c['index']}: {c['resolution']}")
+            else:
+                st.warning("No cameras detected.")
+
+    st.divider()
+
+    # Controls
+    col_start, col_stop, col_reset = st.columns(3)
+    with col_start:
+        start = st.button("Start", key="rt_start", type="primary")
+    with col_stop:
+        stop = st.button("Stop", key="rt_stop")
+    with col_reset:
+        reset_throw = st.button("New Throw", key="rt_reset")
+
+    if stop:
+        st.session_state.rt_running = False
+
+    if start:
+        st.session_state.rt_running = True
+        st.session_state.rt_camera_idx = camera_idx
+        st.session_state.rt_state = "calibrating"
+        st.session_state.rt_throws = []
+        st.session_state.rt_before_frame = None
+
+    if reset_throw and st.session_state.rt_running:
+        st.session_state.rt_state = "waiting"
+
+    # Session stats
+    if st.session_state.rt_throws:
+        st.sidebar.subheader("Session Stats")
+        throws = st.session_state.rt_throws
+        st.sidebar.write(f"Throws: {len(throws)}")
+        st.sidebar.write(f"Pins: {', '.join(str(t) for t in throws)}")
+        st.sidebar.write(f"Avg: {sum(throws) / len(throws):.1f}")
+
+    # Main feed
+    if not st.session_state.rt_running:
+        st.info(
+            "Press **Start** to begin the live analysis session.\n\n"
+            "**Controls:**\n"
+            "- **Start**: Open camera and begin calibration\n"
+            "- **Stop**: End session\n"
+            "- **New Throw**: Reset tracker for next throw\n\n"
+            "**Setup tips:**\n"
+            "- Position camera behind the bowler, elevated and centered on the lane\n"
+            "- iPhone: connect via USB, it should appear as Continuity Camera (index 1)\n"
+            "- Keep the camera steady during calibration (~3 seconds)"
+        )
+        return
+
+    _run_realtime_feed()
+
+
+def _run_realtime_feed():
+    """Run the real-time camera feed with lane calibration and ball tracking."""
+
+    # Add src to path for imports
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+    from realtime import config as rt_config
+    from realtime.calibrator import LaneCalibrator
+    from realtime.tracker import RealtimeTracker
+
+    camera_idx = st.session_state.rt_camera_idx
+    cap = cv2.VideoCapture(camera_idx)
+
+    if not cap.isOpened():
+        st.error(
+            f"Cannot open camera {camera_idx}. "
+            "Try a different index or check your USB connection."
+        )
+        st.session_state.rt_running = False
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, rt_config.CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rt_config.CAMERA_HEIGHT)
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    st.write(f"Camera opened: {w}x{h} (index {camera_idx})")
+
+    frame_placeholder = st.empty()
+    status_placeholder = st.empty()
+    metrics_placeholder = st.empty()
+
+    calibrator = LaneCalibrator()
+    tracker = None
+    state = "calibrating"
+    before_frame = None
+    pin_settle_start = None
+    frame_count = 0
+
+    try:
+        while st.session_state.rt_running:
+            ret, frame = cap.read()
+            if not ret:
+                status_placeholder.warning("Camera frame read failed. Retrying...")
+                time.sleep(0.05)
+                continue
+
+            frame_count += 1
+            vis_frame = frame.copy()
+
+            # === CALIBRATING ===
+            if state == "calibrating":
+                status_placeholder.info(
+                    f"Calibrating lane boundaries... "
+                    f"(frame {calibrator._frame_count if hasattr(calibrator, '_frame_count') else frame_count})"
+                )
+
+                done = calibrator.add_frame(frame)
+
+                # Draw calibration progress
+                cv2.putText(
+                    vis_frame, "CALIBRATING - Keep camera steady",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
+                )
+
+                if done:
+                    b = calibrator.boundaries
+                    tracker = RealtimeTracker(
+                        rt_config,
+                        b["frame_width"], b["frame_height"],
+                        b["foul_line_y"],
+                        top_boundary_y=b.get("top_y"),
+                    )
+                    before_frame = frame.copy()
+                    state = "waiting"
+                    status_placeholder.success("Lane calibrated! Waiting for throw...")
+
+            # === WAITING ===
+            elif state == "waiting":
+                masked = calibrator.apply_mask(frame)
+                result = tracker.process_frame(masked)
+
+                # Draw lane boundaries
+                _draw_boundaries(vis_frame, calibrator)
+
+                cv2.putText(
+                    vis_frame, "WAITING - Roll the ball",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                )
+
+                if result.get("detection") is not None:
+                    state = "tracking"
+                    status_placeholder.info("Ball detected! Tracking...")
+
+            # === TRACKING ===
+            elif state == "tracking":
+                masked = calibrator.apply_mask(frame)
+                result = tracker.process_frame(masked)
+
+                _draw_boundaries(vis_frame, calibrator)
+                _draw_ball(vis_frame, result)
+
+                cv2.putText(
+                    vis_frame, "TRACKING",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
+                )
+
+                if result.get("throw_complete", False):
+                    pin_settle_start = time.time()
+                    state = "pin_settle"
+
+            # === PIN SETTLE ===
+            elif state == "pin_settle":
+                _draw_boundaries(vis_frame, calibrator)
+                settle_time = rt_config.PIN_SETTLE_FRAMES / rt_config.CAMERA_FPS
+                elapsed = time.time() - pin_settle_start
+
+                cv2.putText(
+                    vis_frame,
+                    f"Pins settling... {elapsed:.1f}s / {settle_time:.1f}s",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
+                )
+
+                if elapsed >= settle_time:
+                    pins = _detect_pins_realtime(before_frame, frame, calibrator, rt_config)
+                    st.session_state.rt_throws.append(pins)
+                    metrics_placeholder.metric("Last throw", f"{pins} pins")
+                    state = "result"
+                    result_start = time.time()
+
+            # === SHOWING RESULT ===
+            elif state == "result":
+                _draw_boundaries(vis_frame, calibrator)
+                throws = st.session_state.rt_throws
+                last = throws[-1] if throws else 0
+
+                cv2.putText(
+                    vis_frame, f"PINS DOWN: {last}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3,
+                )
+
+                if time.time() - result_start > 3.0:
+                    tracker.reset()
+                    before_frame = frame.copy()
+                    state = "waiting"
+                    status_placeholder.success("Ready for next throw!")
+
+            # Display frame (BGR -> RGB for Streamlit)
+            frame_placeholder.image(
+                cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB),
+                channels="RGB",
+                use_container_width=True,
+            )
+
+            # Streamlit needs a small sleep to process UI events (stop button)
+            time.sleep(0.03)
+
+    finally:
+        cap.release()
+
+
+def _draw_boundaries(frame, calibrator):
+    """Draw lane boundaries on the frame."""
+    if not calibrator.calibrated or calibrator.boundaries is None:
+        return
+    b = calibrator.boundaries
+    h, w = frame.shape[:2]
+
+    # Foul line
+    foul_y = b.get("foul_line_y")
+    if foul_y:
+        cv2.line(frame, (0, foul_y), (w, foul_y), (0, 0, 255), 2)
+
+    # Left/right boundaries
+    left_x = b.get("left_x")
+    right_x = b.get("right_x")
+    top_y = b.get("top_y", 0) or 0
+    if left_x:
+        cv2.line(frame, (left_x, top_y), (left_x, foul_y or h), (255, 0, 0), 2)
+    if right_x:
+        cv2.line(frame, (right_x, top_y), (right_x, foul_y or h), (255, 0, 0), 2)
+
+    # Top boundary
+    if top_y:
+        cv2.line(frame, (left_x or 0, top_y), (right_x or w, top_y), (0, 255, 0), 2)
+
+
+def _draw_ball(frame, result):
+    """Draw ball detection circle on the frame."""
+    det = result.get("detection")
+    if det is None:
+        return
+    x, y, r = int(det.get("x", 0)), int(det.get("y", 0)), int(det.get("radius", 10))
+    cv2.circle(frame, (x, y), r, (0, 255, 255), 2)
+    cv2.circle(frame, (x, y), 3, (0, 255, 255), -1)
+
+
+def _detect_pins_realtime(before_frame, after_frame, calibrator, cfg):
+    """Simple pin detection via frame differencing for real-time mode."""
+    if before_frame is None or calibrator.boundaries is None:
+        return 0
+
+    b = calibrator.boundaries
+    top_y = b.get("top_y", 0) or 0
+    foul_y = b.get("foul_line_y", before_frame.shape[0])
+
+    pin_region_h = max(1, int((foul_y - top_y) * 0.2))
+    y1 = max(0, top_y - 20)
+    y2 = top_y + pin_region_h
+    x1 = b.get("left_x", 0) or 0
+    x2 = b.get("right_x", before_frame.shape[1]) or before_frame.shape[1]
+
+    if y2 <= y1 or x2 <= x1:
+        return 0
+
+    before_crop = before_frame[y1:y2, x1:x2]
+    after_crop = after_frame[y1:y2, x1:x2]
+
+    gray_before = cv2.cvtColor(before_crop, cv2.COLOR_BGR2GRAY)
+    gray_after = cv2.cvtColor(after_crop, cv2.COLOR_BGR2GRAY)
+
+    diff = cv2.absdiff(gray_before, gray_after)
+    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    pin_count = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if hasattr(cfg, "MIN_PIN_AREA") and hasattr(cfg, "MAX_PIN_AREA"):
+            if cfg.MIN_PIN_AREA <= area <= cfg.MAX_PIN_AREA:
+                pin_count += 1
+        elif 50 <= area <= 3000:
+            pin_count += 1
+
+    return min(pin_count, 10)
 
 
 if __name__ == "__main__":
