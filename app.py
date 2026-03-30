@@ -307,288 +307,531 @@ def _detect_cameras() -> list:
 
 
 def _page_realtime_camera():
-    """Real-time camera analysis page."""
+    """
+    Real-time camera analysis page.
 
-    # Init session state for realtime
-    for key in (
-        "rt_running", "rt_camera_idx", "rt_state", "rt_calibrator",
-        "rt_tracker", "rt_throws", "rt_before_frame", "rt_pin_settle_start",
-    ):
-        st.session_state.setdefault(key, None)
-    st.session_state.setdefault("rt_running", False)
-    st.session_state.setdefault("rt_throws", [])
+    Flow:
+    1. SETUP     - Select camera, press Connect
+    2. CALIBRATE - Auto lane detection (~1 second)
+    3. READY     - Shows calibrated lane. Press "Arm Throw" to start listening
+    4. ARMED     - Waiting for ball detection, auto-transitions to tracking
+    5. TRACKING  - Following the ball down the lane
+    6. REVIEW    - Shows result (pins, replay of captured frames). Save or New Throw.
+    """
 
-    st.subheader("Real-Time Bowling Analysis")
-    st.write(
-        "Connect your iPhone via USB (Continuity Camera) or a USB webcam. "
-        "The system will calibrate the lane automatically, then track each throw."
-    )
+    # Session state init
+    defaults = {
+        "rt_phase": "setup",       # setup, calibrate, ready, armed, tracking, review
+        "rt_camera_idx": 0,
+        "rt_throws": [],           # list of dicts: {pins, frames, trajectory}
+        "rt_captured_frames": [],   # frames captured during current throw
+        "rt_trajectory": [],        # ball positions during current throw
+        "rt_last_pins": 0,
+        "rt_calibrator": None,
+        "rt_tracker": None,
+        "rt_before_frame": None,
+        "rt_boundaries": None,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
-    # Camera selection
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        camera_idx = st.number_input(
-            "Camera index", min_value=0, max_value=10, value=0, step=1,
-            help="0 = built-in webcam, 1 = iPhone Continuity Camera (usually). "
-                 "Try different indices if your camera doesn't appear.",
-        )
-    with col2:
-        if st.button("Detect cameras"):
-            cams = _detect_cameras()
-            if cams:
-                for c in cams:
-                    st.write(f"Camera {c['index']}: {c['resolution']}")
-            else:
-                st.warning("No cameras detected.")
+    phase = st.session_state.rt_phase
 
-    st.divider()
+    # ── SETUP ──
+    if phase == "setup":
+        st.subheader("Real-Time Bowling Analysis")
 
-    # Controls
-    col_start, col_stop, col_reset = st.columns(3)
-    with col_start:
-        start = st.button("Start", key="rt_start", type="primary")
-    with col_stop:
-        stop = st.button("Stop", key="rt_stop")
-    with col_reset:
-        reset_throw = st.button("New Throw", key="rt_reset")
+        st.markdown("""
+**How it works:**
+1. Connect your camera (iPhone via USB / Continuity Camera, or webcam)
+2. Point it at the lane from behind, elevated and centered
+3. The system calibrates the lane boundaries automatically
+4. Press **Arm Throw** when you're ready to bowl
+5. The system tracks the ball and counts pins
+6. Review the result, save it, or start a new throw
+        """)
 
-    if stop:
-        st.session_state.rt_running = False
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            camera_idx = st.number_input(
+                "Camera index", min_value=0, max_value=10, value=0, step=1,
+                help="0 = built-in webcam, 1 = iPhone Continuity Camera (usually)",
+            )
+        with col2:
+            if st.button("Detect cameras"):
+                with st.spinner("Scanning..."):
+                    cams = _detect_cameras()
+                if cams:
+                    for c in cams:
+                        st.success(f"Camera {c['index']}: {c['resolution']}")
+                else:
+                    st.warning("No cameras found.")
 
-    if start:
-        st.session_state.rt_running = True
-        st.session_state.rt_camera_idx = camera_idx
-        st.session_state.rt_state = "calibrating"
-        st.session_state.rt_throws = []
-        st.session_state.rt_before_frame = None
+        if st.button("Connect Camera", type="primary"):
+            st.session_state.rt_camera_idx = camera_idx
+            st.session_state.rt_phase = "calibrate"
+            st.rerun()
 
-    if reset_throw and st.session_state.rt_running:
-        st.session_state.rt_state = "waiting"
+    # ── CALIBRATE ──
+    elif phase == "calibrate":
+        _run_calibration_phase()
 
-    # Session stats
-    if st.session_state.rt_throws:
-        st.sidebar.subheader("Session Stats")
-        throws = st.session_state.rt_throws
-        st.sidebar.write(f"Throws: {len(throws)}")
-        st.sidebar.write(f"Pins: {', '.join(str(t) for t in throws)}")
-        st.sidebar.write(f"Avg: {sum(throws) / len(throws):.1f}")
+    # ── READY ──
+    elif phase == "ready":
+        _show_ready_phase()
 
-    # Main feed
-    if not st.session_state.rt_running:
-        st.info(
-            "Press **Start** to begin the live analysis session.\n\n"
-            "**Controls:**\n"
-            "- **Start**: Open camera and begin calibration\n"
-            "- **Stop**: End session\n"
-            "- **New Throw**: Reset tracker for next throw\n\n"
-            "**Setup tips:**\n"
-            "- Position camera behind the bowler, elevated and centered on the lane\n"
-            "- iPhone: connect via USB, it should appear as Continuity Camera (index 1)\n"
-            "- Keep the camera steady during calibration (~3 seconds)"
-        )
-        return
+    # ── ARMED / TRACKING ──
+    elif phase in ("armed", "tracking"):
+        _run_throw_tracking()
 
-    _run_realtime_feed()
+    # ── REVIEW ──
+    elif phase == "review":
+        _show_review_phase()
 
 
-def _run_realtime_feed():
-    """Run the real-time camera feed with lane calibration and ball tracking."""
-
+def _run_calibration_phase():
+    """Calibrate lane boundaries from live camera."""
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-    from realtime import config as rt_config
     from realtime.calibrator import LaneCalibrator
-    from realtime.tracker import RealtimeTracker
     from lane_detection import config as lane_config
 
-    # Override lane config for faster real-time calibration (30 frames instead of 100)
-    REALTIME_CALIBRATION_FRAMES = 30
+    CAL_FRAMES = 30
     original_num = lane_config.NUM_COLLECTION_FRAMES
-    lane_config.NUM_COLLECTION_FRAMES = REALTIME_CALIBRATION_FRAMES
+    lane_config.NUM_COLLECTION_FRAMES = CAL_FRAMES
 
-    camera_idx = st.session_state.rt_camera_idx
-    cap = cv2.VideoCapture(camera_idx)
+    st.subheader("Calibrating Lane...")
+    st.write("Keep the camera steady and pointed at the lane.")
 
+    frame_placeholder = st.empty()
+    progress_bar = st.progress(0, text="Collecting frames...")
+
+    cap = cv2.VideoCapture(st.session_state.rt_camera_idx)
     if not cap.isOpened():
-        st.error(
-            f"Cannot open camera {camera_idx}. "
-            "Try a different index or check your USB connection."
-        )
-        st.session_state.rt_running = False
+        st.error("Cannot open camera. Go back and try a different index.")
+        if st.button("Back to Setup"):
+            st.session_state.rt_phase = "setup"
+            st.rerun()
         lane_config.NUM_COLLECTION_FRAMES = original_num
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # Layout: video feed on left (large), info panel on right
-    col_feed, col_info = st.columns([3, 1])
-
-    with col_info:
-        st.markdown(f"**Camera:** {w}x{h} (idx {camera_idx})")
-        status_placeholder = st.empty()
-        progress_placeholder = st.empty()
-        metrics_placeholder = st.empty()
-        state_placeholder = st.empty()
-        throws_placeholder = st.empty()
-
-    with col_feed:
-        frame_placeholder = st.empty()
-
     calibrator = LaneCalibrator()
-    tracker = None
-    state = "calibrating"
-    before_frame = None
-    pin_settle_start = None
-    result_start = None
-    frame_count = 0
+    calibrated = False
 
     try:
-        while st.session_state.rt_running:
+        while not calibrated:
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.03)
                 continue
 
-            frame_count += 1
-            vis_frame = frame.copy()
+            done = calibrator.add_frame(frame)
+            progress = calibrator.progress
 
-            # === CALIBRATING ===
-            if state == "calibrating":
-                done = calibrator.add_frame(frame)
-                progress = calibrator.progress
+            progress_bar.progress(progress, text=f"Collecting frames: {int(progress * 100)}%")
 
-                # Progress bar
-                progress_placeholder.progress(
-                    progress,
-                    text=f"Calibrating: {int(progress * 100)}% ({len(calibrator._collected_frames)}/{REALTIME_CALIBRATION_FRAMES} frames)"
-                )
+            # Draw on frame
+            vis = frame.copy()
+            bar_w = int(vis.shape[1] * 0.5)
+            bar_x = (vis.shape[1] - bar_w) // 2
+            bar_y = vis.shape[0] - 50
+            cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + 25), (40, 40, 40), -1)
+            cv2.rectangle(vis, (bar_x, bar_y), (bar_x + int(bar_w * progress), bar_y + 25), (0, 200, 255), -1)
+            _draw_text_with_bg(vis, "CALIBRATING - Keep camera steady",
+                               (10, 35), scale=0.8, color=(0, 200, 255))
 
-                # Draw progress bar on frame
-                bar_w = int(vis_frame.shape[1] * 0.6)
-                bar_h = 30
-                bar_x = (vis_frame.shape[1] - bar_w) // 2
-                bar_y = vis_frame.shape[0] - 60
-                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
-                fill_w = int(bar_w * progress)
-                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 200, 255), -1)
-                cv2.rectangle(vis_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 2)
+            frame_placeholder.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
+                                    channels="RGB", use_container_width=True)
 
-                _draw_text_with_bg(vis_frame, "CALIBRATING - Keep camera steady on the lane",
-                                   (10, 40), scale=0.9, color=(0, 200, 255))
-                _draw_text_with_bg(vis_frame, f"{int(progress * 100)}%",
-                                   (bar_x + bar_w // 2 - 20, bar_y + 22), scale=0.7, color=(255, 255, 255))
+            if done:
+                calibrated = True
+                st.session_state.rt_calibrator = calibrator
+                st.session_state.rt_boundaries = calibrator.boundaries
+                st.session_state.rt_before_frame = frame.copy()
 
-                if done:
-                    b = calibrator.boundaries
-                    try:
-                        tracker = RealtimeTracker(
-                            rt_config,
-                            b["frame_width"], b["frame_height"],
-                            b["foul_line_y"],
-                            top_boundary_y=b.get("top_y"),
-                        )
-                        before_frame = frame.copy()
-                        state = "waiting"
-                        progress_placeholder.empty()
-                        status_placeholder.success("Lane calibrated!")
-                    except Exception as e:
-                        status_placeholder.error(f"Tracker init failed: {e}")
-                        state = "calibrating"
-                        calibrator = LaneCalibrator()
-
-            # === WAITING ===
-            elif state == "waiting":
-                try:
-                    masked = calibrator.apply_mask(frame)
-                    result = tracker.process_frame(masked)
-                except Exception:
-                    result = {}
-
-                _draw_boundaries(vis_frame, calibrator)
-                _draw_text_with_bg(vis_frame, "READY - Roll the ball",
-                                   (10, 40), scale=0.9, color=(0, 255, 0))
-                state_placeholder.info("Waiting for throw...")
-
-                if result.get("detection") is not None:
-                    state = "tracking"
-
-            # === TRACKING ===
-            elif state == "tracking":
-                try:
-                    masked = calibrator.apply_mask(frame)
-                    result = tracker.process_frame(masked)
-                except Exception:
-                    result = {}
-
-                _draw_boundaries(vis_frame, calibrator)
-                _draw_ball(vis_frame, result)
-                _draw_text_with_bg(vis_frame, "TRACKING",
-                                   (10, 40), scale=0.9, color=(0, 100, 255))
-                state_placeholder.warning("Tracking ball...")
-
-                if result.get("throw_complete", False):
-                    pin_settle_start = time.time()
-                    state = "pin_settle"
-
-            # === PIN SETTLE ===
-            elif state == "pin_settle":
-                _draw_boundaries(vis_frame, calibrator)
-                settle_time = getattr(rt_config, 'PIN_SETTLE_FRAMES', 60) / getattr(rt_config, 'CAMERA_FPS', 30)
-                elapsed = time.time() - pin_settle_start
-                pct = min(elapsed / settle_time, 1.0)
-
-                _draw_text_with_bg(vis_frame,
-                                   f"Pins settling... {elapsed:.1f}s / {settle_time:.1f}s",
-                                   (10, 40), scale=0.9, color=(0, 255, 255))
-                state_placeholder.info(f"Waiting for pins to settle... {int(pct * 100)}%")
-
-                if elapsed >= settle_time:
-                    pins = _detect_pins_realtime(before_frame, frame, calibrator, rt_config)
-                    st.session_state.rt_throws.append(pins)
-                    state = "result"
-                    result_start = time.time()
-
-            # === SHOWING RESULT ===
-            elif state == "result":
-                _draw_boundaries(vis_frame, calibrator)
-                throws = st.session_state.rt_throws
-                last = throws[-1] if throws else 0
-
-                _draw_text_with_bg(vis_frame, f"PINS DOWN: {last}/10",
-                                   (10, 50), scale=1.4, color=(0, 255, 0), thickness=3)
-                metrics_placeholder.metric("Last Throw", f"{last} pins")
-                state_placeholder.success(f"Result: {last} pins down!")
-
-                # Update throws display
-                if throws:
-                    throws_placeholder.write(
-                        f"**Session:** {len(throws)} throws | "
-                        f"Pins: {', '.join(str(t) for t in throws)} | "
-                        f"Avg: {sum(throws)/len(throws):.1f}"
-                    )
-
-                if time.time() - result_start > 3.0:
-                    if tracker:
-                        tracker.reset()
-                    before_frame = frame.copy()
-                    state = "waiting"
-
-            # Display frame (BGR -> RGB)
-            frame_placeholder.image(
-                cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB),
-                channels="RGB",
-                use_container_width=True,
-            )
+                # Save a snapshot of the calibrated view
+                vis_cal = frame.copy()
+                calibrator.draw_boundaries(vis_cal)
+                _draw_text_with_bg(vis_cal, "CALIBRATED", (10, 35), scale=1.0, color=(0, 255, 0))
+                frame_placeholder.image(cv2.cvtColor(vis_cal, cv2.COLOR_BGR2RGB),
+                                        channels="RGB", use_container_width=True)
 
             time.sleep(0.03)
 
     finally:
         cap.release()
         lane_config.NUM_COLLECTION_FRAMES = original_num
+
+    if calibrated:
+        b = calibrator.boundaries
+        st.success(
+            f"Lane calibrated! "
+            f"Foul line: Y={b['foul_line_y']}, "
+            f"Left: X={b['left_x']}, Right: X={b['right_x']}"
+        )
+        st.session_state.rt_phase = "ready"
+        time.sleep(1)
+        st.rerun()
+
+
+def _show_ready_phase():
+    """Show calibrated lane and controls."""
+    st.subheader("Lane Calibrated - Ready to Bowl")
+
+    # Show boundaries info
+    b = st.session_state.rt_boundaries
+    if b:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Foul Line", f"Y={b['foul_line_y']}")
+        col2.metric("Lane Left", f"X={b['left_x']}")
+        col3.metric("Lane Right", f"X={b['right_x']}")
+
+    st.divider()
+
+    # Show session history
+    throws = st.session_state.rt_throws
+    if throws:
+        st.markdown("### Session History")
+        for i, t in enumerate(throws, 1):
+            pins = t["pins"]
+            label = "STRIKE!" if pins == 10 else f"{pins} pins"
+            st.write(f"**Throw {i}:** {label}")
+        total = sum(t["pins"] for t in throws)
+        st.write(f"**Total:** {total} pins in {len(throws)} throws (avg: {total/len(throws):.1f})")
+        st.divider()
+
+    # Main action buttons
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Arm Throw", type="primary", help="Start listening for the ball"):
+            st.session_state.rt_captured_frames = []
+            st.session_state.rt_trajectory = []
+            st.session_state.rt_phase = "armed"
+            st.rerun()
+    with col2:
+        if st.button("Recalibrate", help="Re-detect lane boundaries"):
+            st.session_state.rt_phase = "calibrate"
+            st.rerun()
+    with col3:
+        if throws and st.button("Save Session"):
+            _save_realtime_session()
+
+    st.info(
+        "Press **Arm Throw** when you're ready to bowl. "
+        "The system will detect the ball automatically and track it down the lane."
+    )
+
+
+def _run_throw_tracking():
+    """Armed/Tracking: capture frames until throw completes."""
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+    from realtime import config as rt_config
+    from realtime.calibrator import LaneCalibrator
+    from realtime.tracker import RealtimeTracker
+
+    calibrator = st.session_state.rt_calibrator
+    b = st.session_state.rt_boundaries
+
+    if calibrator is None or b is None:
+        st.error("Lost calibration data. Recalibrating...")
+        st.session_state.rt_phase = "calibrate"
+        st.rerun()
+        return
+
+    cap = cv2.VideoCapture(st.session_state.rt_camera_idx)
+    if not cap.isOpened():
+        st.error("Cannot open camera.")
+        st.session_state.rt_phase = "setup"
+        st.rerun()
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    # Init tracker
+    try:
+        tracker = RealtimeTracker(
+            rt_config,
+            b["frame_width"], b["frame_height"],
+            b["foul_line_y"],
+            top_boundary_y=b.get("top_y"),
+        )
+    except Exception as e:
+        cap.release()
+        st.error(f"Failed to initialize tracker: {e}")
+        st.session_state.rt_phase = "ready"
+        st.rerun()
+        return
+
+    is_armed = st.session_state.rt_phase == "armed"
+
+    col_feed, col_info = st.columns([3, 1])
+    with col_info:
+        state_text = st.empty()
+        if is_armed:
+            state_text.info("ARMED - Waiting for ball...")
+        else:
+            state_text.warning("TRACKING ball...")
+        cancel_placeholder = st.empty()
+        if cancel_placeholder.button("Cancel", key="cancel_throw"):
+            cap.release()
+            st.session_state.rt_phase = "ready"
+            st.rerun()
+            return
+
+    with col_feed:
+        frame_placeholder = st.empty()
+
+    captured_frames = st.session_state.rt_captured_frames
+    trajectory = st.session_state.rt_trajectory
+    before_frame = st.session_state.rt_before_frame
+    tracking = not is_armed
+    pin_settle_start = None
+    max_frames = 600  # 20 second timeout
+
+    try:
+        for _ in range(max_frames):
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.03)
+                continue
+
+            vis = frame.copy()
+            _draw_boundaries(vis, calibrator)
+
+            try:
+                masked = calibrator.apply_mask(frame)
+                result = tracker.process_frame(masked)
+            except Exception:
+                result = {}
+
+            det = result.get("detection")
+
+            if not tracking:
+                # ARMED - waiting for ball
+                _draw_text_with_bg(vis, "ARMED - Waiting for ball...",
+                                   (10, 40), scale=0.9, color=(0, 200, 255))
+
+                if det is not None:
+                    tracking = True
+                    state_text.warning("TRACKING ball!")
+                    before_frame = frame.copy()
+                    st.session_state.rt_before_frame = before_frame
+            else:
+                # TRACKING
+                _draw_ball(vis, result)
+                _draw_text_with_bg(vis, "TRACKING",
+                                   (10, 40), scale=0.9, color=(0, 100, 255))
+
+                # Record frame and position
+                captured_frames.append(frame.copy())
+                if det:
+                    trajectory.append({
+                        "frame": len(captured_frames) - 1,
+                        "x": det.get("x"), "y": det.get("y"),
+                        "radius": det.get("radius"),
+                    })
+
+                    # Draw trajectory trail
+                    for j in range(1, len(trajectory)):
+                        p1 = trajectory[j - 1]
+                        p2 = trajectory[j]
+                        if p1.get("x") and p2.get("x"):
+                            cv2.line(vis,
+                                     (int(p1["x"]), int(p1["y"])),
+                                     (int(p2["x"]), int(p2["y"])),
+                                     (255, 0, 255), 2)
+
+                # Check if throw complete
+                if result.get("throw_complete", False):
+                    _draw_text_with_bg(vis, "THROW COMPLETE!",
+                                       (10, 80), scale=1.0, color=(0, 255, 0))
+                    frame_placeholder.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
+                                            channels="RGB", use_container_width=True)
+
+                    # Wait for pins to settle
+                    state_text.info("Pins settling...")
+                    settle_frames = getattr(rt_config, 'PIN_SETTLE_FRAMES', 60)
+                    for _ in range(settle_frames):
+                        ret, frame = cap.read()
+                        if ret:
+                            captured_frames.append(frame.copy())
+                        time.sleep(0.03)
+
+                    # Detect pins
+                    after_frame = frame if ret else captured_frames[-1]
+                    pins = _detect_pins_realtime(before_frame, after_frame, calibrator, rt_config)
+                    st.session_state.rt_last_pins = pins
+                    st.session_state.rt_captured_frames = captured_frames
+                    st.session_state.rt_trajectory = trajectory
+
+                    # Record throw
+                    st.session_state.rt_throws.append({
+                        "pins": pins,
+                        "num_frames": len(captured_frames),
+                        "trajectory_points": len(trajectory),
+                    })
+
+                    cap.release()
+                    st.session_state.rt_phase = "review"
+                    st.rerun()
+                    return
+
+            frame_placeholder.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
+                                    channels="RGB", use_container_width=True)
+            time.sleep(0.03)
+
+        # Timeout
+        state_text.warning("Timeout - no throw detected in 20 seconds.")
+
+    finally:
+        cap.release()
+
+    st.session_state.rt_phase = "ready"
+    st.rerun()
+
+
+def _show_review_phase():
+    """Show throw results with replay and save options."""
+    pins = st.session_state.rt_last_pins
+    captured = st.session_state.rt_captured_frames
+    trajectory = st.session_state.rt_trajectory
+    throws = st.session_state.rt_throws
+
+    # Header with result
+    if pins == 10:
+        st.subheader("STRIKE!")
+    elif pins == 0:
+        st.subheader("Gutter Ball")
+    else:
+        st.subheader(f"Result: {pins} Pins Down")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Pins Down", f"{pins}/10")
+    col2.metric("Frames Captured", len(captured))
+    col3.metric("Trajectory Points", len(trajectory))
+
+    st.divider()
+
+    # Replay
+    if captured:
+        st.markdown("### Throw Replay")
+        frame_idx = st.slider("Frame", 0, len(captured) - 1, len(captured) // 2, key="replay_slider")
+
+        vis = captured[frame_idx].copy()
+        calibrator = st.session_state.rt_calibrator
+        if calibrator:
+            _draw_boundaries(vis, calibrator)
+
+        # Draw trajectory trail up to this frame
+        for j in range(1, len(trajectory)):
+            t = trajectory[j]
+            if t["frame"] > frame_idx:
+                break
+            p1 = trajectory[j - 1]
+            if p1.get("x") and t.get("x"):
+                cv2.line(vis,
+                         (int(p1["x"]), int(p1["y"])),
+                         (int(t["x"]), int(t["y"])),
+                         (255, 0, 255), 2)
+
+        # Draw current ball position
+        for t in trajectory:
+            if t["frame"] == frame_idx and t.get("x"):
+                cv2.circle(vis, (int(t["x"]), int(t["y"])),
+                           int(t.get("radius", 10)), (0, 255, 255), 2)
+                break
+
+        _draw_text_with_bg(vis, f"Frame {frame_idx}/{len(captured)-1}  |  {pins} pins",
+                           (10, 35), scale=0.7, color=(255, 255, 255))
+
+        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+
+    # Trajectory data
+    if trajectory:
+        st.markdown("### Trajectory Data")
+        import pandas as pd
+        df = pd.DataFrame(trajectory)
+        st.dataframe(df, use_container_width=True)
+
+    st.divider()
+
+    # Session summary
+    if throws:
+        st.markdown("### Session Summary")
+        for i, t in enumerate(throws, 1):
+            p = t["pins"]
+            label = "STRIKE!" if p == 10 else f"{p} pins"
+            st.write(f"Throw {i}: {label} ({t['trajectory_points']} tracked points)")
+        total = sum(t["pins"] for t in throws)
+        st.metric("Session Total", f"{total} pins in {len(throws)} throws")
+
+    # Action buttons
+    st.divider()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("New Throw", type="primary"):
+            st.session_state.rt_captured_frames = []
+            st.session_state.rt_trajectory = []
+            st.session_state.rt_phase = "ready"
+            st.rerun()
+    with col2:
+        if st.button("Save Session"):
+            _save_realtime_session()
+    with col3:
+        if st.button("End Session"):
+            st.session_state.rt_phase = "setup"
+            st.rerun()
+
+
+def _save_realtime_session():
+    """Save the current session data to disk."""
+    from datetime import datetime
+    import pandas as pd
+
+    throws = st.session_state.rt_throws
+    if not throws:
+        st.warning("No throws to save.")
+        return
+
+    session_dir = OUTPUT_DIR / "realtime_sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_file = session_dir / f"session_{timestamp}.json"
+
+    data = {
+        "timestamp": timestamp,
+        "num_throws": len(throws),
+        "total_pins": sum(t["pins"] for t in throws),
+        "average": sum(t["pins"] for t in throws) / len(throws),
+        "throws": throws,
+        "boundaries": st.session_state.rt_boundaries,
+    }
+
+    # Make JSON-serializable
+    def _serialize(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return obj
+
+    with open(session_file, "w") as f:
+        json.dump(data, f, indent=2, default=_serialize)
+
+    # Save trajectory CSV if available
+    trajectory = st.session_state.rt_trajectory
+    if trajectory:
+        csv_file = session_dir / f"trajectory_{timestamp}.csv"
+        pd.DataFrame(trajectory).to_csv(csv_file, index=False)
+        st.success(f"Session saved to {session_file} and {csv_file}")
+    else:
+        st.success(f"Session saved to {session_file}")
 
 
 def _draw_text_with_bg(frame, text, pos, scale=0.8, color=(255, 255, 255),
